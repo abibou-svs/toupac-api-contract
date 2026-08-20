@@ -1,0 +1,97 @@
+{
+  "id": "toupac-voyage-local",
+  "name": "TOUPAC Voyage - Local",
+  "values": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000/api/v1/toupac/voyage",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "controller_email",
+      "value": "amadou.keita@toupac.dev",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "controller_password",
+      "value": "test123",
+      "type": "secret",
+      "enabled": true
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "secret",
+      "enabled": true
+    },
+    {
+      "key": "refresh_token",
+      "value": "",
+      "type": "secret",
+      "enabled": true
+    },
+    {
+      "key": "controller_public_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "agency_uuid",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "trip_public_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "reservation_public_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "passenger_public_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "parcel_public_id",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "last_idempotency_key",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "last_upload_url",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "last_public_url",
+      "value": "",
+      "type": "default",
+      "enabled": true
+    }
+  ],
+  "_postman_variable_scope": "environment"
+}

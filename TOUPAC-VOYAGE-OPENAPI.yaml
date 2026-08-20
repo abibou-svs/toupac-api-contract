@@ -1,0 +1,1531 @@
+openapi: 3.0.3
+
+info:
+  title: TOUPAC Voyage API
+  description: |
+    Contrat API de l'extension `toupac-voyage` — endpoints custom exposés à l'app mobile **CONTRÔLEUR**.
+
+    **Scope** : seuls les endpoints custom `/api/v1/toupac/voyage/*` sont documentés ici. Les endpoints Fleetbase natifs (`/api/v1/orders/*`, `/api/v1/entities/*`, etc.) restent documentés séparément à https://fleetbase.io/docs/api et ne sont **pas** appelés directement par l'app CONTRÔLEUR.
+
+    **Sécurité** : Bearer JWT partout sauf `/auth/login`. Header `Idempotency-Key: <uuid v4>` obligatoire sur tous les POST/PUT/PATCH/DELETE.
+
+    **Multi-tenant** : `company_uuid` dérivé implicitement du token, jamais passé en input.
+
+    **Références projet** :
+    - Modèle de données : `TOUPAC-VOYAGE-ERD.md` v1.1.1
+    - Architecture : `TOUPAC-VOYAGE-ARCHITECTURE.md` v1.1
+    - Spec MVP : `TOUPAC-VOYAGE-MVP-SPEC.md` v1.1
+  version: 1.0.0
+  contact:
+    name: TOUPAC Backend Lead
+  license:
+    name: AGPL-3.0
+
+servers:
+  - url: http://localhost:8000/api/v1/toupac/voyage
+    description: Local development (Docker Fleetbase)
+  - url: https://staging.toupac.example/api/v1/toupac/voyage
+    description: Staging (à configurer)
+  - url: https://api.toupac.sn/api/v1/toupac/voyage
+    description: Production (souverain SN, à configurer)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Authentification contrôleur, tokens, PIN local
+  - name: Trips
+    description: Voyages (facade sur `fleetbase_orders` avec `order_config=passenger_trip`)
+  - name: Sync
+    description: Queue d'événements offline — endpoint critique de l'app
+  - name: Reservations
+    description: Billets passager (statut embarquement, vente onboard, cas spéciaux)
+  - name: Passengers
+    description: Fiches passager (données RGPD, accès auditté)
+  - name: Parcels
+    description: Colis (facade sur `fleetbase_entities` avec `type=parcel`)
+  - name: Anomalies
+    description: Événements anormaux (double-scan, conflit siège, non-conformité)
+  - name: Incidents
+    description: Événements terrain remontés au dispatcher
+  - name: Uploads
+    description: URLs pré-signées S3 pour upload direct des photos
+
+paths:
+
+  # ============================================================
+  # AUTH
+  # ============================================================
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authentification contrôleur
+      description: |
+        Retourne un access_token (30 min) + refresh_token (30 j) + les infos du contrôleur.
+        Le refresh_token long durée supporte les périodes prolongées offline.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: amadou.keita@toupac.dev
+              password: test123
+      responses:
+        '200':
+          description: Login réussi
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              example:
+                access_token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+                refresh_token: rt_a1b2c3d4e5f6g7h8i9j0
+                access_token_expires_at: '2026-08-25T08:00:00Z'
+                refresh_token_expires_at: '2026-09-24T07:30:00Z'
+                controller:
+                  public_id: ctrl_a1b2c3d4e5
+                  user_uuid: 550e8400-e29b-41d4-a716-446655440000
+                  full_name: Amadou Keïta
+                  matricule: CH-0421
+                  agency:
+                    uuid: 8f14e45f-ceea-467a-a9b8-3f81c0d5f7c3
+                    name: Toupac Transport Bamako
+                  score_conformity: 97.3
+                  total_trips: 1247
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotation des tokens
+      description: Retourne un nouvel access_token et rotate le refresh_token.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+                  example: rt_a1b2c3d4e5f6g7h8i9j0
+      responses:
+        '200':
+          description: Tokens rafraîchis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/InvalidRefreshToken'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Révoque le refresh_token courant
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Logout OK, refresh_token révoqué
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ============================================================
+  # TRIPS (facade sur fleetbase_orders)
+  # ============================================================
+
+  /trips:
+    get:
+      tags: [Trips]
+      summary: Liste les voyages assignés au contrôleur
+      description: |
+        Retourne les voyages `order_config=passenger_trip` où `metadata.controller_uuid = auth().controller.uuid`, filtrés par date.
+      parameters:
+        - name: date
+          in: query
+          schema:
+            type: string
+            format: date
+            example: '2026-08-25'
+          description: Défaut = aujourd'hui
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [scheduled, dispatched, started, completed, canceled]
+        - name: assigned_to_me
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Si false, retourne tous les voyages de l'agence (nécessite droits élargis)
+      responses:
+        '200':
+          description: Liste des voyages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TripSummary'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+              example:
+                data:
+                  - public_id: order_a1b2c3d4e5
+                    internal_id: VYG-2025-0847
+                    route_label: Bamako → Abidjan
+                    scheduled_at: '2026-08-25T07:30:00Z'
+                    status: dispatched
+                    passengers_count: 32
+                    parcels_count: 13
+                meta: {total: 3, per_page: 20, current_page: 1}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /trips/{public_id}:
+    get:
+      tags: [Trips]
+      summary: Détail d'un voyage
+      parameters:
+        - $ref: '#/components/parameters/TripPublicId'
+      responses:
+        '200':
+          description: Détail voyage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Trip'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /trips/{public_id}/manifest:
+    get:
+      tags: [Trips]
+      summary: Manifeste complet du voyage (endpoint critique offline)
+      description: |
+        **Endpoint le plus important côté offline.** Retourne en 1 appel tout ce dont l'app a besoin pour fonctionner sans réseau :
+        - Voyage + chauffeur + véhicule
+        - Toutes les escales (waypoints)
+        - Plan des sièges du véhicule
+        - Politique bagages
+        - Toutes les réservations avec passagers inline (SANS id_card par défaut)
+        - Tous les colis (entities natives + meta TOUPAC)
+
+        **Payload cible : < 500 KB.** Gzippé automatiquement par Caddy.
+      parameters:
+        - $ref: '#/components/parameters/TripPublicId'
+        - name: include_passenger_id_card
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Si true (ability `controller:passengers:read-id-card` requise), inclut les CNI. Chaque accès est loggé dans `passenger_access_log`.
+      responses:
+        '200':
+          description: Manifeste complet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Manifest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /trips/{public_id}/control/open:
+    post:
+      tags: [Trips]
+      summary: Ouvre une session de contrôle
+      description: |
+        Crée une `control_session` liée au voyage. Idempotent : renvoie la session existante si déjà ouverte.
+        Passe l'Order FLB en statut `started` et déclenche l'activity `BOARDING`.
+      parameters:
+        - $ref: '#/components/parameters/TripPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id:
+                  type: string
+                  example: SAMSUNG-A54-abc123
+                device_info:
+                  type: object
+                  additionalProperties: true
+                  example: {os: android, os_version: '14', app_version: '1.0.0', model: 'SM-A546B'}
+      responses:
+        '200':
+          description: Session ouverte (existante ou nouvelle)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ControlSession'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Session déjà ouverte par un autre contrôleur/device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /trips/{public_id}/control/close:
+    post:
+      tags: [Trips]
+      summary: Clôture le voyage
+      description: |
+        **Exige que la queue events soit vide** (contrôlé côté client avant appel).
+        Vérifie cohérence des stats côté serveur, retourne discrepancies éventuels.
+        Déclenche activity `CLOSING` (complete=true) → Order FLB passe en `completed`.
+      parameters:
+        - $ref: '#/components/parameters/TripPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseTripRequest'
+      responses:
+        '200':
+          description: Voyage clôturé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      closed_at:
+                        type: string
+                        format: date-time
+                      discrepancies_server_side:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            field: {type: string}
+                            client_value: {}
+                            server_value: {}
+                            severity: {type: string, enum: [info, warning, blocking]}
+        '422':
+          description: Clôture refusée (queue non vide, ou anomalies critiques non résolues)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ============================================================
+  # SYNC — endpoint critique
+  # ============================================================
+
+  /control-events/batch:
+    post:
+      tags: [Sync]
+      summary: Upload batch d'événements offline (endpoint critique)
+      description: |
+        Cœur du protocole offline. Traite N events transactionnellement, retourne un verdict individuel par event via `client_uuid`.
+
+        - **Max 100 events par requête**
+        - **Idempotence** : `client_uuid` UNIQUE côté serveur — un retry ne double pas l'action
+        - **Idempotency-Key header** : identifie la requête batch elle-même
+        - **Ordre partiel** : events traités dans l'ordre reçu à l'intérieur du batch
+        - **Atomicité par event** : un event rejeté n'annule pas les autres
+        - **Événements rejetés** peuvent auto-générer des anomalies (ex: `seat_conflict`)
+
+        Voir `TOUPAC-VOYAGE-ARCHITECTURE.md` §3-4 pour le protocole détaillé.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlEventBatchRequest'
+            example:
+              events:
+                - client_uuid: 3f5d8c1a-9b4e-4f2a-8c1d-1e2f3a4b5c6d
+                  session_id: csess_a1b2c3d4e5
+                  event_type: reservation_board
+                  target_type: reservation
+                  target_uuid: res_1a2b3c4d5e
+                  payload: {}
+                  created_at_local: '2026-08-25T08:12:34Z'
+                  gps_lat: 12.6392
+                  gps_lng: -8.0029
+                - client_uuid: 4a6e9d2b-ac5f-4e3b-9d2e-2f3a4b5c6d7e
+                  session_id: csess_a1b2c3d4e5
+                  event_type: parcel_verify
+                  target_type: entity
+                  target_uuid: 7d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a
+                  payload: {notes: 'Bon état, poids conforme', photos_urls: ['https://cdn.toupac.sn/parcels/2026/08/col-001-a.jpg']}
+                  created_at_local: '2026-08-25T08:15:22Z'
+                - client_uuid: 5b7f0e3c-bd6a-4f4c-ae3f-3a4b5c6d7e8f
+                  session_id: csess_a1b2c3d4e5
+                  event_type: onboard_sale
+                  target_type: null
+                  target_uuid: null
+                  payload:
+                    passenger: {full_name: 'Ibrahim Sanogo', phone: '+22370123456'}
+                    seat_number: A15
+                    boarding_waypoint_uuid: wp_current_stop
+                    alighting_waypoint_uuid: wp_final_dest
+                    price_xof: 25000
+                  created_at_local: '2026-08-25T09:47:11Z'
+      responses:
+        '200':
+          description: Batch traité (verdicts individuels par event)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlEventBatchResponse'
+              example:
+                results:
+                  - client_uuid: 3f5d8c1a-9b4e-4f2a-8c1d-1e2f3a4b5c6d
+                    status: accepted
+                    server_uuid: cevt_abc123
+                  - client_uuid: 4a6e9d2b-ac5f-4e3b-9d2e-2f3a4b5c6d7e
+                    status: accepted
+                    server_uuid: cevt_def456
+                  - client_uuid: 5b7f0e3c-bd6a-4f4c-ae3f-3a4b5c6d7e8f
+                    status: rejected
+                    conflict_reason: seat_taken_online
+                    anomaly:
+                      public_id: anom_xyz789
+                      severity: critical
+                      type: seat_conflict
+        '400':
+          $ref: '#/components/responses/InvalidBatch'
+        '413':
+          description: Batch trop grand (> 100 events)
+
+  # ============================================================
+  # RESERVATIONS
+  # ============================================================
+
+  /reservations:
+    post:
+      tags: [Reservations]
+      summary: Vente onboard walk-in (cash V1)
+      description: |
+        Crée un nouveau Passenger + Reservation + CashEntry en une transaction.
+
+        **Peut rejeter avec 409** si le siège demandé a été pris entre le snapshot local et l'appel (via app CLIENT V2 ou concurrent contrôleur). Dans ce cas côté app : proposer réattribution siège via `/trips/{id}/seats/available`.
+
+        Normalement appelé via `/control-events/batch` en mode offline. Cet endpoint direct sert au mode online et aux ventes exceptionnelles.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OnboardSaleRequest'
+      responses:
+        '201':
+          description: Réservation créée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Reservation'
+        '409':
+          description: Siège déjà pris
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: SEAT_TAKEN_ONLINE
+                  message: 'Le siège A14 a été vendu en ligne entre-temps'
+                  details:
+                    seat_number: A14
+                    taken_at: '2026-08-25T09:44:22Z'
+                    taken_by_sales_channel: app_client
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /reservations/{public_id}/board:
+    post:
+      tags: [Reservations]
+      summary: Marque un passager embarqué
+      description: Passe `status` à `boarded`, remplit `boarding_at` et `boarded_by_device_id`.
+      parameters:
+        - $ref: '#/components/parameters/ReservationPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gps_lat: {type: number, format: double}
+                gps_lng: {type: number, format: double}
+                gps_accuracy_m: {type: integer}
+      responses:
+        '200':
+          description: Embarquement enregistré
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Reservation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Déjà embarqué (anomaly `duplicate_scan` créée auto)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /reservations/{public_id}/refuse:
+    post:
+      tags: [Reservations]
+      summary: Refuse un embarquement
+      parameters:
+        - $ref: '#/components/parameters/ReservationPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [motif]
+              properties:
+                motif:
+                  type: string
+                  enum:
+                    - billet_invalide
+                    - fraude_presumee
+                    - comportement_inapproprie
+                    - document_manquant
+                    - autre
+                notes:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: Refus enregistré
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Reservation'
+
+  /reservations/{public_id}/special-case:
+    post:
+      tags: [Reservations]
+      summary: Marque un cas spécial (enfant, accompagnant, médical, autre)
+      parameters:
+        - $ref: '#/components/parameters/ReservationPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, authorized]
+              properties:
+                type:
+                  type: string
+                  enum: [child_under_4, companion, medical, other]
+                authorized:
+                  type: boolean
+                  description: Si false → refus + création anomaly
+                notes:
+                  type: string
+                  maxLength: 500
+                evidence_urls:
+                  type: array
+                  items:
+                    type: string
+                    format: uri
+      responses:
+        '200':
+          description: Cas spécial enregistré
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Reservation'
+
+  # ============================================================
+  # PASSENGERS
+  # ============================================================
+
+  /passengers/{public_id}:
+    get:
+      tags: [Passengers]
+      summary: Fiche passager
+      description: |
+        Retourne la fiche passager. Le champ `id_card_number` est retourné UNIQUEMENT si :
+        1. Query param `include_id_card=true`
+        2. Ability `controller:passengers:read-id-card`
+
+        Chaque accès à `id_card_number` est loggé dans `passenger_access_log` avec IP, user, contexte.
+      parameters:
+        - $ref: '#/components/parameters/PassengerPublicId'
+        - name: include_id_card
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: X-Access-Context
+          in: header
+          schema:
+            type: string
+            example: reservation_special_case_check
+          description: Contexte de consultation, tracé dans l'audit log
+      responses:
+        '200':
+          description: Fiche passager
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Passenger'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ============================================================
+  # PARCELS (facade sur fleetbase_entities)
+  # ============================================================
+
+  /parcels/{public_id}/verify:
+    post:
+      tags: [Parcels]
+      summary: Valide un colis (loaded → verified)
+      description: Met à jour `entities.meta.status_toupac=verified`, `meta.verified_at`, `meta.verified_by_user_uuid`.
+      parameters:
+        - $ref: '#/components/parameters/EntityPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: {type: string, maxLength: 500}
+                photos_urls:
+                  type: array
+                  items: {type: string, format: uri}
+      responses:
+        '200':
+          description: Colis validé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Parcel'
+
+  /parcels/{public_id}/refuse:
+    post:
+      tags: [Parcels]
+      summary: Refuse un colis (non conforme, anomalie)
+      description: Passe `meta.status_toupac=refused`, crée automatiquement une `anomaly` type `parcel_non_conform`.
+      parameters:
+        - $ref: '#/components/parameters/EntityPublicId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [motif]
+              properties:
+                motif:
+                  type: string
+                  enum: [poids_non_conforme, contenu_non_declare, colis_endommage, destinataire_absent, autre]
+                notes: {type: string, maxLength: 500}
+                photos_urls:
+                  type: array
+                  items: {type: string, format: uri}
+      responses:
+        '200':
+          description: Colis refusé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Parcel'
+                  anomaly:
+                    $ref: '#/components/schemas/Anomaly'
+
+  # ============================================================
+  # ANOMALIES
+  # ============================================================
+
+  /anomalies:
+    post:
+      tags: [Anomalies]
+      summary: Crée une anomalie manuelle
+      description: |
+        La plupart des anomalies sont créées **automatiquement côté serveur** suite à events rejetés (double-scan, seat conflict). Cet endpoint sert aux anomalies manuelles remontées par le contrôleur.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, type, severity, title]
+              properties:
+                session_id: {type: string, example: csess_a1b2c3d4e5}
+                type: {type: string, enum: [duplicate_scan, seat_conflict, parcel_non_conform, expired_ticket, wrong_trip, other]}
+                severity: {type: string, enum: [low, moderate, critical]}
+                title: {type: string, maxLength: 200}
+                description: {type: string, maxLength: 2000}
+                target_type: {type: string, enum: [reservation, entity, waypoint, other]}
+                target_uuid: {type: string, format: uuid}
+                evidence_urls:
+                  type: array
+                  items: {type: string, format: uri}
+      responses:
+        '201':
+          description: Anomalie créée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Anomaly'
+
+  # ============================================================
+  # INCIDENTS
+  # ============================================================
+
+  /incidents:
+    post:
+      tags: [Incidents]
+      summary: Signale un incident terrain
+      description: |
+        Événement terrain (bagages, comportement, panne). Peut déclencher notification dispatcher si `notify_dispatcher=true`.
+        V1 : la notification dispatcher est mockée (logue serveur), la vraie push notif arrive V2.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIncidentRequest'
+      responses:
+        '201':
+          description: Incident créé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Incident'
+
+  # ============================================================
+  # UPLOADS
+  # ============================================================
+
+  /uploads/presign:
+    post:
+      tags: [Uploads]
+      summary: Génère une URL pré-signée S3 pour upload direct
+      description: |
+        L'app upload directement le fichier vers S3 avec `upload_url` (PUT). Le `public_url` est ensuite référencé dans les events (photos_urls d'incident, parcel_verify, etc.).
+
+        Découplé de la queue events pour ne pas engorger l'API avec des blobs.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [context, filename, content_type, size]
+              properties:
+                context:
+                  type: string
+                  enum: [incident, parcel_verify, parcel_refuse, special_case, passenger_id_card, passenger_photo]
+                filename:
+                  type: string
+                  example: incident-bagages-2026-08-25.jpg
+                content_type:
+                  type: string
+                  example: image/jpeg
+                size:
+                  type: integer
+                  description: Taille en octets (max 10 Mo)
+                  maximum: 10485760
+      responses:
+        '200':
+          description: URL pré-signée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upload_url:
+                    type: string
+                    format: uri
+                    description: PUT direct S3, TTL 5 min
+                  public_url:
+                    type: string
+                    format: uri
+                    description: URL finale à référencer dans les events
+                  s3_key:
+                    type: string
+                    example: incidents/2026/08/inc_a1b2c3d4e5.jpg
+                  expires_at:
+                    type: string
+                    format: date-time
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: UUID v4 unique par requête. Rejoué → réponse cachée retournée (TTL 7j).
+
+    TripPublicId:
+      name: public_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^order_[a-z0-9]{10}$'
+        example: order_a1b2c3d4e5
+
+    ReservationPublicId:
+      name: public_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^res_[a-z0-9]{10}$'
+        example: res_1a2b3c4d5e
+
+    PassengerPublicId:
+      name: public_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^pass_[a-z0-9]{10}$'
+        example: pass_9f8e7d6c5b
+
+    EntityPublicId:
+      name: public_id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: public_id d'une `fleetbase_entities` de type parcel
+        example: entity_p1q2r3s4t5
+
+  responses:
+
+    Unauthorized:
+      description: Token absent ou invalide
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: {code: UNAUTHORIZED, message: 'Access token required'}
+
+    InvalidCredentials:
+      description: Email ou mot de passe incorrect
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: {code: INVALID_CREDENTIALS, message: 'Email or password is incorrect'}
+
+    InvalidRefreshToken:
+      description: Refresh token invalide ou expiré (forcer logout + reconnexion)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: {code: REFRESH_TOKEN_EXPIRED, message: 'Refresh token expired, please login again'}
+
+    Forbidden:
+      description: Ability manquante (RBAC)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    NotFound:
+      description: Ressource introuvable ou hors scope contrôleur
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ValidationError:
+      description: Payload invalide (champs manquants ou mal formés)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: 'The given data was invalid'
+              details:
+                email: ['The email field is required']
+                password: ['The password must be at least 8 characters']
+
+    InvalidBatch:
+      description: Batch mal formé (structure event invalide)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    TooManyRequests:
+      description: Rate limit dépassé (60 req/min par IP, 300 pour /control-events/batch)
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+
+    # ============ Auth ============
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, minLength: 8}
+
+    TokenPair:
+      type: object
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        access_token_expires_at: {type: string, format: date-time}
+        refresh_token_expires_at: {type: string, format: date-time}
+
+    LoginResponse:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          properties:
+            controller:
+              $ref: '#/components/schemas/Controller'
+
+    Controller:
+      type: object
+      properties:
+        public_id: {type: string, example: ctrl_a1b2c3d4e5}
+        user_uuid: {type: string, format: uuid}
+        full_name: {type: string}
+        matricule: {type: string, example: CH-0421}
+        agency:
+          type: object
+          properties:
+            uuid: {type: string, format: uuid}
+            name: {type: string}
+        score_conformity: {type: number, format: float, example: 97.3}
+        score_rating: {type: number, format: float, example: 4.8}
+        total_trips: {type: integer, example: 1247}
+
+    # ============ Trips ============
+
+    TripSummary:
+      type: object
+      properties:
+        public_id: {type: string, example: order_a1b2c3d4e5}
+        internal_id: {type: string, example: VYG-2025-0847}
+        route_label: {type: string, example: 'Bamako → Abidjan'}
+        scheduled_at: {type: string, format: date-time}
+        arrival_scheduled_at: {type: string, format: date-time}
+        status: {$ref: '#/components/schemas/TripStatus'}
+        passengers_count: {type: integer}
+        parcels_count: {type: integer}
+        vehicle:
+          type: object
+          properties:
+            plate_number: {type: string, example: BA-1234-ML}
+            model: {type: string, example: Mercedes Sprinter}
+        driver:
+          type: object
+          properties:
+            full_name: {type: string, example: Diallo Karim}
+
+    Trip:
+      allOf:
+        - $ref: '#/components/schemas/TripSummary'
+        - type: object
+          properties:
+            departure_scheduled_at: {type: string, format: date-time}
+            departure_actual_at: {type: string, format: date-time, nullable: true}
+            arrival_actual_at: {type: string, format: date-time, nullable: true}
+            waypoints:
+              type: array
+              items:
+                $ref: '#/components/schemas/Waypoint'
+            vehicle_full:
+              type: object
+              properties:
+                uuid: {type: string, format: uuid}
+                plate_number: {type: string}
+                model: {type: string}
+                make: {type: string}
+                seating_capacity: {type: integer}
+            driver_full:
+              type: object
+              properties:
+                uuid: {type: string, format: uuid}
+                full_name: {type: string}
+                phone: {type: string}
+                matricule: {type: string, nullable: true}
+                experience_years: {type: integer, nullable: true}
+                rating: {type: number, format: float, nullable: true}
+            controller:
+              $ref: '#/components/schemas/Controller'
+            luggage_policy:
+              $ref: '#/components/schemas/LuggagePolicy'
+            current_activity:
+              type: string
+              example: BOARDING
+              description: Activity FLB courante (dernière transition enregistrée)
+
+    TripStatus:
+      type: string
+      enum: [created, dispatched, started, completed, canceled]
+
+    Waypoint:
+      type: object
+      properties:
+        uuid: {type: string, format: uuid}
+        public_id: {type: string}
+        sequence: {type: integer, example: 1}
+        type: {type: string, enum: [pickup, stop, dropoff]}
+        place:
+          type: object
+          properties:
+            uuid: {type: string, format: uuid}
+            name: {type: string, example: 'Bamako Gare Centrale'}
+            city: {type: string, example: Bamako}
+            country: {type: string, example: ML}
+            latitude: {type: number, format: double, nullable: true}
+            longitude: {type: number, format: double, nullable: true}
+        scheduled_at: {type: string, format: date-time}
+        actual_arrival_at: {type: string, format: date-time, nullable: true}
+        actual_departure_at: {type: string, format: date-time, nullable: true}
+        service_time_seconds: {type: integer, example: 900}
+        # Compteurs métier calculés dynamiquement
+        boarded_count: {type: integer, example: 20}
+        alighted_count: {type: integer, example: 0}
+        parcels_loaded: {type: integer, example: 8}
+        parcels_unloaded: {type: integer, example: 0}
+
+    # ============ Manifest (payload critique) ============
+
+    Manifest:
+      description: Payload agrégé du voyage pour usage offline
+      type: object
+      properties:
+        trip: {$ref: '#/components/schemas/Trip'}
+        seat_map: {$ref: '#/components/schemas/SeatMap'}
+        reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationWithPassenger'
+        parcels:
+          type: array
+          items:
+            $ref: '#/components/schemas/Parcel'
+        control_session: {$ref: '#/components/schemas/ControlSession', nullable: true}
+        snapshot_taken_at: {type: string, format: date-time}
+        manifest_version: {type: string, example: '1.0'}
+        # JWT public key pour vérification offline des QR billets
+        jwt_public_key:
+          type: object
+          description: Clé publique RS256 pour vérifier les QR JWT hors ligne (V1 embedded, V2 refreshable via /jwks.json)
+          properties:
+            kid: {type: string, example: 'toupac-voyage-2026'}
+            alg: {type: string, example: RS256}
+            key_pem: {type: string, description: 'PEM public key'}
+
+    SeatMap:
+      type: object
+      properties:
+        vehicle_uuid: {type: string, format: uuid}
+        total_seats: {type: integer, example: 45}
+        layout:
+          type: object
+          description: Format JSON du plan des sièges
+          properties:
+            rows: {type: integer, example: 12}
+            seats_per_row: {type: integer, example: 4}
+            aisle_after_col: {type: integer, example: 2}
+            positions:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: {type: string, example: A14}
+                  row: {type: integer}
+                  col: {type: integer}
+                  type: {type: string, enum: [standard, window, aisle, premium, pmr]}
+
+    LuggagePolicy:
+      type: object
+      properties:
+        public_id: {type: string}
+        name: {type: string, example: 'Standard route Bamako-Abidjan'}
+        free_luggage_count: {type: integer, example: 1}
+        extra_luggage_price_xof: {type: integer, example: 2000}
+        weight_limit_kg: {type: number, format: float, example: 20}
+        over_weight_price_per_kg_xof: {type: integer, example: 500}
+
+    # ============ Reservations ============
+
+    Reservation:
+      type: object
+      properties:
+        public_id: {type: string, example: res_1a2b3c4d5e}
+        order_uuid: {type: string, format: uuid}
+        passenger_id: {type: integer}
+        seat_number: {type: string, example: A14}
+        boarding_waypoint_uuid: {type: string, format: uuid}
+        alighting_waypoint_uuid: {type: string, format: uuid}
+        qr_code_jwt: {type: string, description: 'JWT RS256 (peut être omis dans les réponses d''embarquement pour alléger)'}
+        reference: {type: string, example: BIL-2025-4521}
+        price_xof: {type: integer, example: 25000}
+        payment_method: {type: string, enum: [cash, mobile_money, card, free]}
+        sales_channel: {type: string, enum: [app_client, agency_counter, onboard, import]}
+        status: {type: string, enum: [booked, boarded, no_show, refused, cancelled]}
+        special_case_type: {type: string, enum: [none, child_under_4, companion, medical, other]}
+        refuse_motif: {type: string, nullable: true}
+        boarding_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    ReservationWithPassenger:
+      allOf:
+        - $ref: '#/components/schemas/Reservation'
+        - type: object
+          properties:
+            passenger: {$ref: '#/components/schemas/PassengerSummary'}
+
+    OnboardSaleRequest:
+      type: object
+      required: [trip_public_id, passenger, seat_number, boarding_waypoint_uuid, alighting_waypoint_uuid]
+      properties:
+        trip_public_id: {type: string, example: order_a1b2c3d4e5}
+        passenger:
+          type: object
+          required: [full_name, phone]
+          properties:
+            full_name: {type: string, maxLength: 150}
+            phone: {type: string, description: 'Format E.164', example: '+22370123456'}
+        seat_number: {type: string, example: A15}
+        boarding_waypoint_uuid: {type: string, format: uuid}
+        alighting_waypoint_uuid: {type: string, format: uuid}
+        price_xof: {type: integer, minimum: 0}
+        extra_luggage_count: {type: integer, default: 0, description: 'Nombre de bagages payants supp (au-delà de la franchise politique)'}
+
+    # ============ Passengers ============
+
+    PassengerSummary:
+      type: object
+      description: Version light sans données sensibles
+      properties:
+        public_id: {type: string, example: pass_9f8e7d6c5b}
+        full_name: {type: string, example: 'Coulibaly Fatoumata'}
+        phone: {type: string, example: '+22370123456'}
+        gender: {type: string, enum: [M, F, other, unspecified], nullable: true}
+        medical_flags:
+          type: array
+          items: {type: string}
+          nullable: true
+
+    Passenger:
+      allOf:
+        - $ref: '#/components/schemas/PassengerSummary'
+        - type: object
+          properties:
+            email: {type: string, format: email, nullable: true}
+            date_of_birth: {type: string, format: date, nullable: true}
+            id_card_type: {type: string, enum: [national_id, passport, driver_license, other], nullable: true}
+            id_card_number: {type: string, nullable: true, description: 'Inclus SEULEMENT si include_id_card=true + ability. Chaque accès loggé.'}
+            id_card_url: {type: string, format: uri, nullable: true}
+            photo_url: {type: string, format: uri, nullable: true}
+            preferences:
+              type: object
+              additionalProperties: true
+              nullable: true
+
+    # ============ Parcels (facade sur fleetbase_entities) ============
+
+    Parcel:
+      description: Facade sur `fleetbase_entities` avec `type=parcel`. Les champs meta_toupac.* sont extraits de `entities.meta`.
+      type: object
+      properties:
+        public_id: {type: string, example: entity_p1q2r3s4t5}
+        internal_id: {type: string, example: COL-2025-0847}
+        name: {type: string, example: 'Sac de riz 25kg'}
+        qr_code: {type: string, description: 'QR opaque natif Fleetbase'}
+        weight: {type: number, format: float}
+        weight_unit: {type: string, enum: [kg, g, lb, oz], default: kg}
+        declared_value: {type: integer, nullable: true, description: 'En XOF'}
+        price: {type: integer, description: 'En XOF'}
+        currency: {type: string, example: XOF}
+        recipient:
+          type: object
+          properties:
+            full_name: {type: string, example: 'Traoré Amadou'}
+            phone: {type: string, example: '+22505123456'}
+        sender:
+          type: object
+          nullable: true
+          properties:
+            contact_uuid: {type: string, format: uuid, nullable: true}
+            passenger_uuid: {type: string, format: uuid, nullable: true}
+            full_name: {type: string}
+            phone: {type: string}
+        origin_place:
+          type: object
+          properties:
+            name: {type: string, example: 'Bamako Gare Centrale'}
+        destination_place:
+          type: object
+          properties:
+            name: {type: string, example: 'Abidjan Adjamé'}
+        photos_urls:
+          type: array
+          items: {type: string, format: uri}
+        # Champs meta_toupac.*
+        status_toupac:
+          type: string
+          enum: [pending, loaded, verified, refused, delivered, lost, anomaly]
+        sales_channel:
+          type: string
+          enum: [app_client, agency_counter, onboard]
+        linked_reservation_uuid:
+          type: string
+          format: uuid
+          nullable: true
+          description: Si le colis est un bagage passager
+        notes_controleur:
+          type: string
+          nullable: true
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+        boarding_waypoint_uuid:
+          type: string
+          format: uuid
+        alighting_waypoint_uuid:
+          type: string
+          format: uuid
+
+    # ============ Control Session ============
+
+    ControlSession:
+      type: object
+      properties:
+        public_id: {type: string, example: csess_a1b2c3d4e5}
+        order_uuid: {type: string, format: uuid}
+        controller_public_id: {type: string}
+        device_id: {type: string}
+        opened_at: {type: string, format: date-time}
+        closed_at: {type: string, format: date-time, nullable: true}
+        sync_state: {type: string, enum: [draft, syncing, synced, failed]}
+        last_sync_at: {type: string, format: date-time, nullable: true}
+
+    CloseTripRequest:
+      type: object
+      required: [summary]
+      properties:
+        summary:
+          type: object
+          properties:
+            passengers:
+              type: object
+              properties:
+                expected: {type: integer}
+                boarded: {type: integer}
+                no_show: {type: integer}
+                refused: {type: integer}
+                special_cases: {type: integer}
+            parcels:
+              type: object
+              properties:
+                expected: {type: integer}
+                verified: {type: integer}
+                refused: {type: integer}
+                anomalies: {type: integer}
+            cash:
+              type: object
+              properties:
+                total_collected_xof: {type: integer}
+                declared_handed_over_xof: {type: integer}
+                difference_xof: {type: integer, description: 'Peut être négatif'}
+            anomalies:
+              type: object
+              properties:
+                total: {type: integer}
+                resolved: {type: integer}
+                critical_unresolved: {type: integer}
+            incidents:
+              type: object
+              properties:
+                total: {type: integer}
+                critical: {type: integer}
+        notes: {type: string, maxLength: 1000, nullable: true}
+
+    # ============ Sync ============
+
+    ControlEventBatchRequest:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ControlEventInput'
+
+    ControlEventInput:
+      type: object
+      required: [client_uuid, session_id, event_type, payload, created_at_local]
+      properties:
+        client_uuid:
+          type: string
+          format: uuid
+          description: UUID v4 généré côté client, garantit l'idempotence
+        session_id:
+          type: string
+          example: csess_a1b2c3d4e5
+        event_type:
+          type: string
+          enum:
+            - reservation_board
+            - reservation_refuse
+            - reservation_special_case
+            - parcel_verify
+            - parcel_refuse
+            - onboard_sale
+            - anomaly_create
+            - anomaly_resolve
+            - incident_create
+            - activity_transition
+        target_type:
+          type: string
+          nullable: true
+          enum: [reservation, entity, anomaly, incident, order]
+        target_uuid:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null pour les events de création
+        payload:
+          type: object
+          description: Payload spécifique à event_type — schéma libre validé côté serveur
+          additionalProperties: true
+        created_at_local:
+          type: string
+          format: date-time
+        gps_lat: {type: number, format: double, nullable: true}
+        gps_lng: {type: number, format: double, nullable: true}
+        gps_accuracy_m: {type: integer, nullable: true}
+
+    ControlEventBatchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlEventResult'
+
+    ControlEventResult:
+      type: object
+      properties:
+        client_uuid: {type: string, format: uuid}
+        status: {type: string, enum: [accepted, rejected]}
+        server_uuid:
+          type: string
+          nullable: true
+          description: UUID de l'entité créée/modifiée côté serveur (si accepted)
+        conflict_reason:
+          type: string
+          nullable: true
+          description: Ex `seat_taken_online`, `already_boarded`, `duplicate_scan`
+        anomaly:
+          $ref: '#/components/schemas/Anomaly'
+          nullable: true
+          description: Anomaly auto-générée côté serveur (si conflit)
+
+    # ============ Anomalies / Incidents ============
+
+    Anomaly:
+      type: object
+      properties:
+        public_id: {type: string, example: anom_x9y8z7w6v5}
+        session_id: {type: string, example: csess_a1b2c3d4e5}
+        event_id: {type: integer, nullable: true}
+        type:
+          type: string
+          enum: [duplicate_scan, seat_conflict, parcel_non_conform, expired_ticket, wrong_trip, other]
+        severity: {type: string, enum: [low, moderate, critical]}
+        status: {type: string, enum: [to_treat, in_progress, resolved, ignored]}
+        title: {type: string}
+        description: {type: string, nullable: true}
+        target_type: {type: string, nullable: true}
+        target_uuid: {type: string, format: uuid, nullable: true}
+        evidence_urls:
+          type: array
+          items: {type: string, format: uri}
+          nullable: true
+        resolved_at: {type: string, format: date-time, nullable: true}
+        resolution_notes: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    CreateIncidentRequest:
+      type: object
+      required: [session_id, order_uuid, type, severity, title]
+      properties:
+        session_id: {type: string, example: csess_a1b2c3d4e5}
+        order_uuid: {type: string, format: uuid}
+        type: {type: string, enum: [luggage, behavior, safety, breakdown, other]}
+        severity: {type: string, enum: [low, moderate, critical]}
+        title: {type: string, maxLength: 200}
+        description: {type: string, maxLength: 2000}
+        photos_urls:
+          type: array
+          items: {type: string, format: uri}
+        gps_lat: {type: number, format: double, nullable: true}
+        gps_lng: {type: number, format: double, nullable: true}
+        notify_dispatcher: {type: boolean, default: false}
+
+    Incident:
+      type: object
+      properties:
+        public_id: {type: string, example: inc_a1b2c3d4e5}
+        session_id: {type: string}
+        order_uuid: {type: string, format: uuid}
+        reporter_user_uuid: {type: string, format: uuid}
+        type: {type: string}
+        severity: {type: string, enum: [low, moderate, critical]}
+        title: {type: string}
+        description: {type: string, nullable: true}
+        photos_urls:
+          type: array
+          items: {type: string, format: uri}
+        gps_lat: {type: number, format: double, nullable: true}
+        gps_lng: {type: number, format: double, nullable: true}
+        gps_address: {type: string, nullable: true}
+        dispatcher_notified: {type: boolean}
+        dispatcher_notified_at: {type: string, format: date-time, nullable: true}
+        status: {type: string, enum: [reported, notified, in_progress, resolved]}
+        resolved_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    # ============ Generic ============
+
+    PaginationMeta:
+      type: object
+      properties:
+        total: {type: integer}
+        per_page: {type: integer}
+        current_page: {type: integer}
+        last_page: {type: integer}
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, example: VALIDATION_ERROR}
+            message: {type: string}
+            details:
+              type: object
+              additionalProperties: true
+              nullable: true

@@ -1,0 +1,432 @@
+{
+  "info": {
+    "name": "TOUPAC Voyage API",
+    "description": "Collection Postman pour les endpoints custom `/api/v1/toupac/voyage/*` de l'extension `toupac-voyage`.\n\n**Setup rapide** :\n1. Importer aussi l'environnement `TOUPAC-VOYAGE-POSTMAN-ENV.json`\n2. Lancer 'Auth > Login' → l'access_token est capturé auto\n3. Lancer 'Trips > List trips today' pour valider\n\n**Idempotency-Key** : généré automatiquement en UUID v4 sur chaque POST/PUT/DELETE via pre-request script au niveau collection.\n\n**Références** :\n- OpenAPI : `TOUPAC-VOYAGE-OPENAPI.yaml`\n- Modèle : `TOUPAC-VOYAGE-ERD.md`\n- Architecture : `TOUPAC-VOYAGE-ARCHITECTURE.md`",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{access_token}}", "type": "string" }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Auto-set Idempotency-Key en UUID v4 pour tout POST/PUT/PATCH/DELETE",
+          "const method = pm.request.method.toUpperCase();",
+          "if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {",
+          "  const uuid = require('uuid').v4();",
+          "  pm.request.headers.upsert({ key: 'Idempotency-Key', value: uuid });",
+          "  pm.environment.set('last_idempotency_key', uuid);",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000/api/v1/toupac/voyage" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login (capture tokens)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{controller_email}}\",\n  \"password\": \"{{controller_password}}\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/auth/login", "host": ["{{base_url}}"], "path": ["auth", "login"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const data = pm.response.json();",
+                  "if (data.access_token) {",
+                  "  pm.environment.set('access_token', data.access_token);",
+                  "  pm.environment.set('refresh_token', data.refresh_token);",
+                  "  pm.environment.set('controller_public_id', data.controller.public_id);",
+                  "  pm.environment.set('agency_uuid', data.controller.agency.uuid);",
+                  "  console.log('Tokens captured. Controller:', data.controller.full_name);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refresh token",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/auth/refresh", "host": ["{{base_url}}"], "path": ["auth", "refresh"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const data = pm.response.json();",
+                  "  pm.environment.set('access_token', data.access_token);",
+                  "  pm.environment.set('refresh_token', data.refresh_token);",
+                  "  console.log('Tokens rotated.');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/logout", "host": ["{{base_url}}"], "path": ["auth", "logout"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Trips",
+      "item": [
+        {
+          "name": "List trips today (assigned to me)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/trips?date=today&assigned_to_me=true",
+              "host": ["{{base_url}}"],
+              "path": ["trips"],
+              "query": [
+                { "key": "date", "value": "today" },
+                { "key": "assigned_to_me", "value": "true" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const data = pm.response.json();",
+                  "if (data.data && data.data.length > 0) {",
+                  "  pm.environment.set('trip_public_id', data.data[0].public_id);",
+                  "  console.log('First trip captured:', data.data[0].internal_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get trip detail",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/trips/{{trip_public_id}}", "host": ["{{base_url}}"], "path": ["trips", "{{trip_public_id}}"] }
+          }
+        },
+        {
+          "name": "Get trip manifest (offline snapshot)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/trips/{{trip_public_id}}/manifest",
+              "host": ["{{base_url}}"],
+              "path": ["trips", "{{trip_public_id}}", "manifest"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Manifest payload < 500 KB', () => {",
+                  "  const size = pm.response.responseSize;",
+                  "  console.log('Manifest size:', size, 'bytes');",
+                  "  pm.expect(size).to.be.lessThan(500 * 1024);",
+                  "});",
+                  "const data = pm.response.json().data;",
+                  "if (data.control_session) {",
+                  "  pm.environment.set('session_id', data.control_session.public_id);",
+                  "}",
+                  "if (data.reservations && data.reservations.length > 0) {",
+                  "  pm.environment.set('reservation_public_id', data.reservations[0].public_id);",
+                  "}",
+                  "if (data.parcels && data.parcels.length > 0) {",
+                  "  pm.environment.set('parcel_public_id', data.parcels[0].public_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Open control session",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"POSTMAN-DEVICE-{{$guid}}\",\n  \"device_info\": {\n    \"os\": \"postman\",\n    \"app_version\": \"1.0.0-test\"\n  }\n}"
+            },
+            "url": { "raw": "{{base_url}}/trips/{{trip_public_id}}/control/open", "host": ["{{base_url}}"], "path": ["trips", "{{trip_public_id}}", "control", "open"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.environment.set('session_id', pm.response.json().data.public_id);",
+                  "  console.log('Session opened:', pm.environment.get('session_id'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Close trip",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"summary\": {\n    \"passengers\": { \"expected\": 32, \"boarded\": 28, \"no_show\": 3, \"refused\": 1, \"special_cases\": 1 },\n    \"parcels\": { \"expected\": 13, \"verified\": 12, \"refused\": 1, \"anomalies\": 1 },\n    \"cash\": { \"total_collected_xof\": 25000, \"declared_handed_over_xof\": 25000, \"difference_xof\": 0 },\n    \"anomalies\": { \"total\": 3, \"resolved\": 3, \"critical_unresolved\": 0 },\n    \"incidents\": { \"total\": 0, \"critical\": 0 }\n  },\n  \"notes\": \"Voyage nominal, RAS\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/trips/{{trip_public_id}}/control/close", "host": ["{{base_url}}"], "path": ["trips", "{{trip_public_id}}", "control", "close"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sync",
+      "item": [
+        {
+          "name": "Batch upload events (critical endpoint)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"client_uuid\": \"{{$guid}}\",\n      \"session_id\": \"{{session_id}}\",\n      \"event_type\": \"reservation_board\",\n      \"target_type\": \"reservation\",\n      \"target_uuid\": \"{{reservation_public_id}}\",\n      \"payload\": {},\n      \"created_at_local\": \"{{$isoTimestamp}}\",\n      \"gps_lat\": 12.6392,\n      \"gps_lng\": -8.0029\n    },\n    {\n      \"client_uuid\": \"{{$guid}}\",\n      \"session_id\": \"{{session_id}}\",\n      \"event_type\": \"parcel_verify\",\n      \"target_type\": \"entity\",\n      \"target_uuid\": \"{{parcel_public_id}}\",\n      \"payload\": {\n        \"notes\": \"Bon état, poids conforme\",\n        \"photos_urls\": [\"https://cdn.example/parcels/col-001-a.jpg\"]\n      },\n      \"created_at_local\": \"{{$isoTimestamp}}\"\n    },\n    {\n      \"client_uuid\": \"{{$guid}}\",\n      \"session_id\": \"{{session_id}}\",\n      \"event_type\": \"onboard_sale\",\n      \"target_type\": null,\n      \"target_uuid\": null,\n      \"payload\": {\n        \"passenger\": {\n          \"full_name\": \"Ibrahim Sanogo\",\n          \"phone\": \"+22370987654\"\n        },\n        \"seat_number\": \"A20\",\n        \"boarding_waypoint_uuid\": \"REPLACE_WITH_WAYPOINT_UUID\",\n        \"alighting_waypoint_uuid\": \"REPLACE_WITH_WAYPOINT_UUID\",\n        \"price_xof\": 25000\n      },\n      \"created_at_local\": \"{{$isoTimestamp}}\"\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/control-events/batch", "host": ["{{base_url}}"], "path": ["control-events", "batch"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const results = pm.response.json().results;",
+                  "results.forEach(r => {",
+                  "  const status = r.status === 'accepted' ? '✅' : '❌';",
+                  "  console.log(`${status} ${r.client_uuid}: ${r.status}${r.conflict_reason ? ' (' + r.conflict_reason + ')' : ''}`);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Reservations",
+      "item": [
+        {
+          "name": "Onboard sale (cash V1)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"trip_public_id\": \"{{trip_public_id}}\",\n  \"passenger\": {\n    \"full_name\": \"Ibrahim Sanogo\",\n    \"phone\": \"+22370987654\"\n  },\n  \"seat_number\": \"A25\",\n  \"boarding_waypoint_uuid\": \"REPLACE_WITH_WAYPOINT_UUID\",\n  \"alighting_waypoint_uuid\": \"REPLACE_WITH_WAYPOINT_UUID\",\n  \"price_xof\": 25000,\n  \"extra_luggage_count\": 0\n}"
+            },
+            "url": { "raw": "{{base_url}}/reservations", "host": ["{{base_url}}"], "path": ["reservations"] }
+          }
+        },
+        {
+          "name": "Board passenger",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gps_lat\": 12.6392,\n  \"gps_lng\": -8.0029,\n  \"gps_accuracy_m\": 10\n}"
+            },
+            "url": { "raw": "{{base_url}}/reservations/{{reservation_public_id}}/board", "host": ["{{base_url}}"], "path": ["reservations", "{{reservation_public_id}}", "board"] }
+          }
+        },
+        {
+          "name": "Refuse reservation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"motif\": \"billet_invalide\",\n  \"notes\": \"Billet correspond à un autre voyage\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/reservations/{{reservation_public_id}}/refuse", "host": ["{{base_url}}"], "path": ["reservations", "{{reservation_public_id}}", "refuse"] }
+          }
+        },
+        {
+          "name": "Special case (child under 4)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"child_under_4\",\n  \"authorized\": true,\n  \"notes\": \"Voyage gratuit sur genoux du parent\",\n  \"evidence_urls\": []\n}"
+            },
+            "url": { "raw": "{{base_url}}/reservations/{{reservation_public_id}}/special-case", "host": ["{{base_url}}"], "path": ["reservations", "{{reservation_public_id}}", "special-case"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Passengers",
+      "item": [
+        {
+          "name": "Get passenger (without id_card)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/passengers/{{passenger_public_id}}", "host": ["{{base_url}}"], "path": ["passengers", "{{passenger_public_id}}"] }
+          }
+        },
+        {
+          "name": "Get passenger (with id_card - AUDITED)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Access-Context", "value": "reservation_special_case_check" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/passengers/{{passenger_public_id}}?include_id_card=true",
+              "host": ["{{base_url}}"],
+              "path": ["passengers", "{{passenger_public_id}}"],
+              "query": [{ "key": "include_id_card", "value": "true" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Parcels",
+      "item": [
+        {
+          "name": "Verify parcel",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notes\": \"Bon état, poids conforme\",\n  \"photos_urls\": [\n    \"https://cdn.example/parcels/col-001-verify-a.jpg\"\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/parcels/{{parcel_public_id}}/verify", "host": ["{{base_url}}"], "path": ["parcels", "{{parcel_public_id}}", "verify"] }
+          }
+        },
+        {
+          "name": "Refuse parcel",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"motif\": \"poids_non_conforme\",\n  \"notes\": \"Poids déclaré 12kg, réel 25kg\",\n  \"photos_urls\": [\n    \"https://cdn.example/parcels/col-001-refuse-a.jpg\"\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/parcels/{{parcel_public_id}}/refuse", "host": ["{{base_url}}"], "path": ["parcels", "{{parcel_public_id}}", "refuse"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Anomalies",
+      "item": [
+        {
+          "name": "Create manual anomaly",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"type\": \"other\",\n  \"severity\": \"moderate\",\n  \"title\": \"Passager sans billet et sans papiers\",\n  \"description\": \"Passager s'est présenté sans billet ni pièce d'identité\",\n  \"target_type\": \"reservation\",\n  \"target_uuid\": null,\n  \"evidence_urls\": []\n}"
+            },
+            "url": { "raw": "{{base_url}}/anomalies", "host": ["{{base_url}}"], "path": ["anomalies"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Incidents",
+      "item": [
+        {
+          "name": "Report incident (notify dispatcher)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"order_uuid\": \"REPLACE_WITH_ORDER_UUID\",\n  \"type\": \"luggage\",\n  \"severity\": \"moderate\",\n  \"title\": \"Bagages non conformes\",\n  \"description\": \"Un passager refuse de payer un excédent de 25kg non déclaré\",\n  \"photos_urls\": [\n    \"https://cdn.example/incidents/inc-2026-08-25-a.jpg\"\n  ],\n  \"gps_lat\": 12.5678,\n  \"gps_lng\": -7.9876,\n  \"notify_dispatcher\": true\n}"
+            },
+            "url": { "raw": "{{base_url}}/incidents", "host": ["{{base_url}}"], "path": ["incidents"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Uploads",
+      "item": [
+        {
+          "name": "Presign S3 URL (photo incident)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"context\": \"incident\",\n  \"filename\": \"incident-bagages-2026-08-25.jpg\",\n  \"content_type\": \"image/jpeg\",\n  \"size\": 2400000\n}"
+            },
+            "url": { "raw": "{{base_url}}/uploads/presign", "host": ["{{base_url}}"], "path": ["uploads", "presign"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const data = pm.response.json();",
+                  "  pm.environment.set('last_upload_url', data.upload_url);",
+                  "  pm.environment.set('last_public_url', data.public_url);",
+                  "  console.log('Upload URL:', data.upload_url);",
+                  "  console.log('Public URL:', data.public_url);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
